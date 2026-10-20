@@ -527,7 +527,7 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
 - **Secure `type` input** (inject keystrokes into an open desktop session — lock-screen PIN/password; never put secrets on argv):
   ```sh
   # Preferred: open desktop via ui/connect first, then type (reuses the session; does not kick the live view)
-  UU_INPUT_ENV=WORK_LAPTOP_PIN WORK_LAPTOP_PIN='…' \
+  UU_INPUT_ENV=UU_SECRET UU_SECRET='…' \
     uuremote-viewer type DEVICE [--delay-ms 40] [--omit-last 1] [--snapshot /path/out.png]
   # Or: printf '%s' '…' | uuremote-viewer type DEVICE
   # Validate only, no network: uuremote-viewer type DEVICE --dry-run

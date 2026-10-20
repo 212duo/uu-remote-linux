@@ -483,7 +483,7 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
 - **安全输入 `type`**（向已打开的桌面会话注入键盘，适合锁屏 PIN / 密码；文本永不进 argv）：
   ```sh
   # 推荐：先 ui/connect 打开桌面，再 type（复用会话，不顶掉当前画面）
-  UU_INPUT_ENV=WORK_LAPTOP_PIN WORK_LAPTOP_PIN='……' \
+  UU_INPUT_ENV=UU_SECRET UU_SECRET='……' \
     uuremote-viewer type DEVICE [--delay-ms 40] [--omit-last 1] [--snapshot /path/out.png]
   # 或：printf '%s' '……' | uuremote-viewer type DEVICE
   # 只检查、不连网：uuremote-viewer type DEVICE --dry-run

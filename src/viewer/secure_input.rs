@@ -578,12 +578,12 @@ mod tests {
     #[test]
     fn load_from_named_env_and_stdin() {
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("UU_INPUT_ENV", "WORK_LAPTOP_PIN");
-        std::env::set_var("WORK_LAPTOP_PIN", "pin-value");
+        std::env::set_var("UU_INPUT_ENV", "UU_SECRET");
+        std::env::set_var("UU_SECRET", "pin-value");
         let s = load_secret(Cursor::new(b"")).unwrap();
         assert_eq!(s.as_str(), "pin-value");
         assert!(!format!("{s:?}").contains("pin"));
-        assert!(std::env::var("WORK_LAPTOP_PIN").is_err());
+        assert!(std::env::var("UU_SECRET").is_err());
         std::env::remove_var("UU_INPUT_ENV");
         let s = load_secret(Cursor::new(b"from-stdin\n")).unwrap();
         assert_eq!(s.as_str(), "from-stdin");
