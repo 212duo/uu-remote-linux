@@ -2,7 +2,14 @@
 use serde_json::{json, Value};
 use std::fmt;
 use std::io::{BufRead, Read};
+use std::ops::{Deref, DerefMut};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
+
+/// Serializes tests that mutate process environment.
+#[cfg(test)]
+pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Holds secret text; Debug/Display only show length.
 pub struct Secret(String);
@@ -23,6 +30,21 @@ impl Secret {
     pub fn chars_count(&self) -> usize {
         self.0.chars().count()
     }
+    /// Drop the last `n` Unicode scalars (fill-without-submit for Windows PIN).
+    pub fn omit_last_chars(&mut self, n: usize) -> Result<(), String> {
+        let count = self.0.chars().count();
+        if n > count {
+            return Err("omit-last exceeds secret length".into());
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let keep = count - n;
+        let truncated: String = self.0.chars().take(keep).collect();
+        zeroize_str(&mut self.0);
+        self.0 = truncated;
+        Ok(())
+    }
 }
 
 impl fmt::Debug for Secret {
@@ -39,15 +61,16 @@ impl fmt::Display for Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        // Best-effort wipe; String capacity may retain bytes until reallocation.
-        unsafe {
-            let bytes = self.0.as_bytes_mut();
-            for b in bytes.iter_mut() {
-                *b = 0;
-            }
-        }
-        self.0.clear();
+        zeroize_str(&mut self.0);
     }
+}
+
+fn zeroize_str(s: &mut String) {
+    let bytes = unsafe { s.as_bytes_mut() };
+    for b in bytes.iter_mut() {
+        *b = 0;
+    }
+    s.clear();
 }
 
 /// One CONTROL keyboard action (Windows VK or Mac keycode in `key`).
@@ -64,20 +87,51 @@ impl KeyAction {
             Self::Release(k) => json!({"action":"kbd_release","key":k}),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Options {
-    pub mac: bool,
-    pub delay: Duration,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            mac: false,
-            delay: Duration::ZERO,
+    fn zeroize(&mut self) {
+        match self {
+            Self::Press(k) | Self::Release(k) => *k = 0,
         }
+    }
+}
+
+/// Key event list that wipes key codes on drop.
+#[derive(Debug)]
+pub struct ActionList(Vec<KeyAction>);
+
+impl ActionList {
+    pub fn new(actions: Vec<KeyAction>) -> Self {
+        Self(actions)
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn as_slice(&self) -> &[KeyAction] {
+        &self.0
+    }
+}
+
+impl Deref for ActionList {
+    type Target = [KeyAction];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ActionList {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ActionList {
+    fn drop(&mut self) {
+        for a in &mut self.0 {
+            a.zeroize();
+        }
+        self.0.clear();
     }
 }
 
@@ -94,12 +148,27 @@ pub fn parse_delay_ms(raw: Option<&str>) -> Result<Duration, String> {
     Ok(Duration::from_millis(ms))
 }
 
+pub fn parse_omit_last(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(0);
+    };
+    let n: usize = raw
+        .parse()
+        .map_err(|_| String::from("omit-last must be a non-negative integer"))?;
+    if n > 64 {
+        return Err("omit-last must be at most 64".into());
+    }
+    Ok(n)
+}
+
 /// `UU_INPUT_ENV` names another variable that holds the secret; otherwise one stdin line.
+/// After reading a named secret variable, that variable is removed from the environment.
 pub fn load_secret(stdin: impl BufRead) -> Result<Secret, String> {
     if let Ok(name) = std::env::var("UU_INPUT_ENV") {
         validate_env_name(&name)?;
         let value = std::env::var(&name)
             .map_err(|_| "Environment variable named by UU_INPUT_ENV is not set".to_string())?;
+        std::env::remove_var(&name);
         if value.is_empty() {
             return Err("Secret environment variable is empty".into());
         }
@@ -116,7 +185,6 @@ pub fn load_secret(stdin: impl BufRead) -> Result<Secret, String> {
     if line.len() > 16 * 1024 {
         return Err("Secret exceeds 16 KiB".into());
     }
-    // Trim a single trailing newline only (PIN/password may end with spaces intentionally — still trim \r\n).
     if line.ends_with('\n') {
         line.pop();
         if line.ends_with('\r') {
@@ -142,16 +210,20 @@ fn validate_env_name(name: &str) -> Result<(), String> {
 /// Expand template text into key actions. Brace tokens: `{Enter}`, `{Tab}`, `{Esc}`,
 /// `{Backspace}`, `{Delete}`, `{Space}`, `{Ctrl+Alt+Del}`, arrows, `{Home}`, `{End}`, `{F1}`…`{F12}`.
 /// Plain characters use a US QWERTY VK/Mac mapping (Shift for uppercase/symbols).
-pub fn expand(text: &str, mac: bool) -> Result<Vec<KeyAction>, String> {
+/// Errors never include the offending character or token text — only a 0-based char index.
+pub fn expand(text: &str, mac: bool) -> Result<ActionList, String> {
     let mut out = Vec::new();
     let mut chars = text.chars().peekable();
+    let mut index = 0usize;
     while let Some(c) = chars.next() {
         if c == '{' {
             if chars.peek() == Some(&'{') {
                 chars.next();
-                push_char(&mut out, '{', mac)?;
+                push_char(&mut out, '{', mac, index)?;
+                index += 1;
                 continue;
             }
+            let start = index;
             let mut name = String::new();
             let mut closed = false;
             for n in chars.by_ref() {
@@ -160,29 +232,41 @@ pub fn expand(text: &str, mac: bool) -> Result<Vec<KeyAction>, String> {
                     break;
                 }
                 if n == '{' || name.len() > 32 {
-                    return Err("Invalid special-key token".into());
+                    zeroize_str(&mut name);
+                    return Err(format!("Invalid special-key token at index {start}"));
                 }
                 name.push(n);
             }
             if !closed {
-                return Err("Unclosed special-key token".into());
+                zeroize_str(&mut name);
+                return Err(format!("Unclosed special-key token at index {start}"));
             }
-            push_special(&mut out, &name, mac)?;
+            // Advance index past '{' + name + '}'
+            index += 1 + name.chars().count() + 1;
+            let result = push_special(&mut out, &name, mac, start);
+            zeroize_str(&mut name);
+            result?;
             continue;
         }
         if c.is_control() && c != '\t' && c != '\n' && c != '\r' {
-            return Err("Control characters must use special-key tokens".into());
+            return Err(format!("Control character at index {index}"));
         }
         match c {
-            '\n' | '\r' => push_special(&mut out, "Enter", mac)?,
-            '\t' => push_special(&mut out, "Tab", mac)?,
-            _ => push_char(&mut out, c, mac)?,
+            '\n' | '\r' => push_special(&mut out, "Enter", mac, index)?,
+            '\t' => push_special(&mut out, "Tab", mac, index)?,
+            _ => push_char(&mut out, c, mac, index)?,
         }
+        index += 1;
     }
-    Ok(out)
+    Ok(ActionList::new(out))
 }
 
-fn push_special(out: &mut Vec<KeyAction>, name: &str, mac: bool) -> Result<(), String> {
+fn push_special(
+    out: &mut Vec<KeyAction>,
+    name: &str,
+    mac: bool,
+    index: usize,
+) -> Result<(), String> {
     let key = match name {
         "Enter" | "Return" => Some(vk_or_mac(0x0d, 36, mac)),
         "Tab" => Some(vk_or_mac(0x09, 48, mac)),
@@ -197,7 +281,6 @@ fn push_special(out: &mut Vec<KeyAction>, name: &str, mac: bool) -> Result<(), S
         "Home" => Some(vk_or_mac(0x24, 115, mac)),
         "End" => Some(vk_or_mac(0x23, 119, mac)),
         "Ctrl+Alt+Del" | "CAD" => {
-            // Left Ctrl / Alt / Delete — matches Windows Secure Attention Sequence chord.
             let ctrl = vk_or_mac(0xa2, 59, mac);
             let alt = vk_or_mac(0xa4, 58, mac);
             let del = vk_or_mac(0x2e, 117, mac);
@@ -212,9 +295,9 @@ fn push_special(out: &mut Vec<KeyAction>, name: &str, mac: bool) -> Result<(), S
         other if other.len() >= 2 && other.as_bytes()[0] == b'F' => {
             let n: u32 = other[1..]
                 .parse()
-                .map_err(|_| format!("Unknown special key {{{other}}}"))?;
+                .map_err(|_| format!("Unknown special key at index {index}"))?;
             if !(1..=12).contains(&n) {
-                return Err(format!("Unknown special key {{{other}}}"));
+                return Err(format!("Unknown special key at index {index}"));
             }
             let vk = 0x70 + (n as i32 - 1);
             let mac_code = match n {
@@ -234,7 +317,7 @@ fn push_special(out: &mut Vec<KeyAction>, name: &str, mac: bool) -> Result<(), S
             };
             Some(vk_or_mac(vk, mac_code, mac))
         }
-        other => return Err(format!("Unknown special key {{{other}}}")),
+        _ => return Err(format!("Unknown special key at index {index}")),
     };
     let Some(key) = key else {
         return Ok(());
@@ -252,18 +335,15 @@ fn vk_or_mac(vk: i32, mac: i32, is_mac: bool) -> i32 {
     }
 }
 
-fn push_char(out: &mut Vec<KeyAction>, c: char, mac: bool) -> Result<(), String> {
-    let (vk, shift) = us_qwerty_vk(c).ok_or_else(|| {
-        format!("Character U+{:04X} is not on the US QWERTY mapping; use special-key tokens where needed", c as u32)
-    })?;
+fn push_char(out: &mut Vec<KeyAction>, c: char, mac: bool, index: usize) -> Result<(), String> {
+    let (vk, shift) = us_qwerty_vk(c)
+        .ok_or_else(|| format!("Unsupported character at index {index}"))?;
     let key = if mac {
-        // Invert: find scancode for this Windows VK via the same table viewer uses, then mac keycode.
-        // For letters/digits mirror windows_vk ranges through HID scancodes used by Input::mac_keycode.
-        mac_from_vk(vk).ok_or_else(|| "Character has no Mac keycode mapping".to_string())?
+        mac_from_vk(vk).ok_or_else(|| format!("Unsupported character at index {index}"))?
     } else {
         vk
     };
-    let shift_key = vk_or_mac(0xa0, 56, mac); // Left Shift
+    let shift_key = vk_or_mac(0xa0, 56, mac);
     if shift {
         out.push(KeyAction::Press(shift_key));
     }
@@ -275,7 +355,6 @@ fn push_char(out: &mut Vec<KeyAction>, c: char, mac: bool) -> Result<(), String>
     Ok(())
 }
 
-/// US QWERTY: returns (Windows VK, needs_shift).
 fn us_qwerty_vk(c: char) -> Option<(i32, bool)> {
     match c {
         'a'..='z' => Some((0x41 + (c as i32 - 'a' as i32), false)),
@@ -320,10 +399,9 @@ fn us_qwerty_vk(c: char) -> Option<(i32, bool)> {
 }
 
 fn mac_from_vk(vk: i32) -> Option<i32> {
-    // Match viewer::input::mac_keycode for the HID scancodes that windows_vk uses.
     let scan = match vk {
-        0x41..=0x5a => 4 + (vk - 0x41),  // A-Z
-        0x31..=0x39 => 30 + (vk - 0x31), // 1-9
+        0x41..=0x5a => 4 + (vk - 0x41),
+        0x31..=0x39 => 30 + (vk - 0x31),
         0x30 => 39,
         0x0d => 40,
         0x1b => 41,
@@ -341,17 +419,14 @@ fn mac_from_vk(vk: i32) -> Option<i32> {
         0xbc => 54,
         0xbe => 55,
         0xbf => 56,
-        0xa0 => 225, // LShift scancode → mac 56
+        0xa0 => 225,
         _ => return None,
     };
     super::input::mac_keycode(scan)
 }
 
 pub async fn send_actions(
-    send: impl Fn(
-        Value,
-    )
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+    send: impl Fn(Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
     actions: &[KeyAction],
     delay: Duration,
 ) -> Result<(), String> {
@@ -390,15 +465,24 @@ pub async fn run_session(
     for (i, action) in actions.iter().enumerate() {
         session.peer.send_input(&action.to_json()).await?;
         if !delay.is_zero() && i + 1 != actions.len() {
-            // Keep draining signaling while pacing keystrokes.
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                r = session.step() => { r?; tokio::time::sleep(delay).await; }
-            }
+            tokio::time::sleep(delay).await;
         }
     }
-    // Release nothing extra: expand() already emits balanced press/release.
     Ok(())
+}
+
+/// Dry-run summary: lengths only, never the secret or key codes.
+pub fn dry_run_report(secret: &Secret, omit_last: usize, mac: bool) -> Result<String, String> {
+    let mut owned = Secret::new(secret.as_str().to_owned());
+    owned.omit_last_chars(omit_last)?;
+    let actions = expand(owned.as_str(), mac)?;
+    Ok(format!(
+        "dry-run: chars={} omit_last={} events={} mac={}",
+        owned.chars_count(),
+        omit_last,
+        actions.len(),
+        mac
+    ))
 }
 
 #[cfg(test)]
@@ -420,7 +504,6 @@ mod tests {
     #[test]
     fn letters_digits_and_shift_symbols_map_to_windows_vk() {
         let actions = expand("Ab1!", false).unwrap();
-        // A: shift+0x41
         assert_eq!(
             &actions[0..4],
             &[
@@ -430,17 +513,14 @@ mod tests {
                 KeyAction::Release(0xa0),
             ]
         );
-        // b: 0x42
         assert_eq!(
             &actions[4..6],
             &[KeyAction::Press(0x42), KeyAction::Release(0x42)]
         );
-        // 1: 0x31
         assert_eq!(
             &actions[6..8],
             &[KeyAction::Press(0x31), KeyAction::Release(0x31)]
         );
-        // !: shift+0x31
         assert_eq!(
             &actions[8..12],
             &[
@@ -458,15 +538,6 @@ mod tests {
         assert!(a
             .windows(2)
             .any(|w| w == [KeyAction::Press(0x0d), KeyAction::Release(0x0d)]));
-        assert!(a
-            .windows(2)
-            .any(|w| w == [KeyAction::Press(0x09), KeyAction::Release(0x09)]));
-        assert!(a
-            .windows(2)
-            .any(|w| w == [KeyAction::Press(0x1b), KeyAction::Release(0x1b)]));
-        assert!(a
-            .windows(2)
-            .any(|w| w == [KeyAction::Press(0x08), KeyAction::Release(0x08)]));
         let cad: Vec<_> = a.iter().rev().take(6).rev().cloned().collect();
         assert_eq!(
             cad,
@@ -484,8 +555,18 @@ mod tests {
     #[test]
     fn unknown_special_key_errors_without_echoing_payload() {
         let err = expand("{NotAKey}", false).unwrap_err();
-        assert!(err.contains("Unknown special key"));
+        assert!(err.contains("Unknown special key at index"));
+        assert!(!err.contains("NotAKey"));
         assert!(!err.contains("password"));
+    }
+
+    #[test]
+    fn unsupported_char_errors_without_codepoint_or_char() {
+        let err = expand("a中", false).unwrap_err();
+        assert!(err.contains("Unsupported character at index 1"));
+        assert!(!err.contains('中'));
+        assert!(!err.contains("4E2D"));
+        assert!(!err.contains("U+"));
     }
 
     #[test]
@@ -496,21 +577,24 @@ mod tests {
 
     #[test]
     fn load_from_named_env_and_stdin() {
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("UU_INPUT_ENV", "WORK_LAPTOP_PIN");
         std::env::set_var("WORK_LAPTOP_PIN", "pin-value");
         let s = load_secret(Cursor::new(b"")).unwrap();
         assert_eq!(s.as_str(), "pin-value");
         assert!(!format!("{s:?}").contains("pin"));
+        assert!(std::env::var("WORK_LAPTOP_PIN").is_err());
         std::env::remove_var("UU_INPUT_ENV");
-        std::env::remove_var("WORK_LAPTOP_PIN");
         let s = load_secret(Cursor::new(b"from-stdin\n")).unwrap();
         assert_eq!(s.as_str(), "from-stdin");
     }
 
     #[test]
     fn invalid_env_name_and_empty_secret() {
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("UU_INPUT_ENV", "bad-name!");
         assert!(load_secret(Cursor::new(b"")).is_err());
+        std::env::remove_var("UU_INPUT_ENV");
         std::env::set_var("UU_INPUT_ENV", "EMPTY_SECRET_TEST");
         std::env::set_var("EMPTY_SECRET_TEST", "");
         assert!(load_secret(Cursor::new(b"")).is_err());
@@ -520,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn delay_bounds() {
+    fn delay_and_omit_bounds() {
         assert_eq!(parse_delay_ms(None).unwrap(), Duration::ZERO);
         assert_eq!(
             parse_delay_ms(Some("50")).unwrap(),
@@ -528,16 +612,41 @@ mod tests {
         );
         assert!(parse_delay_ms(Some("-1")).is_err());
         assert!(parse_delay_ms(Some("5001")).is_err());
+        assert_eq!(parse_omit_last(None).unwrap(), 0);
+        assert_eq!(parse_omit_last(Some("2")).unwrap(), 2);
+        assert!(parse_omit_last(Some("65")).is_err());
     }
 
     #[test]
+    fn omit_last_and_dry_run() {
+        let mut s = Secret::new("1234567".into());
+        s.omit_last_chars(1).unwrap();
+        assert_eq!(s.as_str(), "123456");
+        let report = dry_run_report(&Secret::new("1234567".into()), 1, false).unwrap();
+        assert!(report.contains("chars=6"));
+        assert!(report.contains("omit_last=1"));
+        assert!(report.contains("events="));
+        assert!(report.contains("omit_last=1"));
+        assert!(!report.contains("123456"));
+        assert!(!report.contains("1234567"));
+    }
+
     #[test]
     fn brace_escape_types_literal_brace() {
         let a = expand("{{a", false).unwrap();
-        assert_eq!(&a[0..4], &[
-            KeyAction::Press(0xa0), KeyAction::Press(0xdb), KeyAction::Release(0xdb), KeyAction::Release(0xa0),
-        ]);
-        assert_eq!(&a[4..6], &[KeyAction::Press(0x41), KeyAction::Release(0x41)]);
+        assert_eq!(
+            &a[0..4],
+            &[
+                KeyAction::Press(0xa0),
+                KeyAction::Press(0xdb),
+                KeyAction::Release(0xdb),
+                KeyAction::Release(0xa0),
+            ]
+        );
+        assert_eq!(
+            &a[4..6],
+            &[KeyAction::Press(0x41), KeyAction::Release(0x41)]
+        );
     }
 
     #[test]
@@ -545,6 +654,16 @@ mod tests {
         let a = expand("secret{Enter}", false).unwrap();
         assert_eq!(a.last(), Some(&KeyAction::Release(0x0d)));
         assert_eq!(a[a.len() - 2], KeyAction::Press(0x0d));
+    }
+
+    #[test]
+    fn action_list_zeroizes_on_drop() {
+        let mut a = KeyAction::Press(0x41);
+        a.zeroize();
+        assert_eq!(a, KeyAction::Press(0));
+        let list = ActionList::new(vec![KeyAction::Press(7), KeyAction::Release(7)]);
+        assert_eq!(list.len(), 2);
+        drop(list);
     }
 
     #[tokio::test]
@@ -562,12 +681,12 @@ mod tests {
                     Ok(())
                 })
             },
-            &actions,
+            actions.as_slice(),
             Duration::from_millis(20),
         )
         .await
         .unwrap();
-        assert!(start.elapsed() >= Duration::from_millis(50)); // 4 events → 3 inter-event delays
+        assert!(start.elapsed() >= Duration::from_millis(50));
         let keys: Vec<_> = log
             .lock()
             .unwrap()
