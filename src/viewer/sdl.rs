@@ -1,5 +1,6 @@
 use super::{desktop::{Frame,FrameSink},input::{Input,Viewport},session::Session};
 use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum,rect::Rect};
+#[derive(Debug)] enum Command { Files, Type }
 pub struct Window { canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
     clipboard:sdl2::clipboard::ClipboardUtil, clipboard_dirty:bool, clipboard_tx:tokio::sync::mpsc::Sender<super::clipboard::ClipboardRequest>, clipboard_requests:tokio::sync::mpsc::Receiver<super::clipboard::ClipboardRequest> }
 impl Window {
@@ -97,18 +98,22 @@ impl FrameSink for Window {
 pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super::desktop::Decoder,view_only:bool)->Result<(),String>{
     #[cfg(uu_gtk)]
     let mut files:Option<tokio::task::JoinHandle<Result<(),String>>>=None;
-    let(tx,mut commands)=tokio::sync::mpsc::channel(8);
+    let(tx,mut commands)=tokio::sync::mpsc::channel::<Command>(8);
     if std::env::var("UU_VIEWER_COMMANDS").as_deref()==Ok("1") {
         std::thread::spawn(move||{
             use std::io::Read;
             let mut input=std::io::stdin().lock();let mut line=Vec::new();let mut byte=[0];
             while input.read(&mut byte).ok()==Some(1){
-                if byte[0]==b'\n'{if line==b"files" && tx.blocking_send(()).is_err(){break}line.clear();}
+                if byte[0]==b'\n'{
+                    let cmd=match line.as_slice(){b"files"=>Some(Command::Files),b"type"=>Some(Command::Type),_=>None};
+                    line.clear();
+                    if let Some(cmd)=cmd { if tx.blocking_send(cmd).is_err(){break} }
+                }
                 else if line.len()<32{line.push(byte[0]);}else{break}
             }
         });
     }else{drop(tx);}
-    let mut command_open=true;let mut requested=false;
+    let mut command_open=true;let mut requested=false;let mut type_requested=false;
     let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
     let mut audio=super::audio::Playback::new(&window._sdl,session.peer.audio.clone());
     let mut input=Input::new(view_only);input.set_mac(window.mac);let mut tick=tokio::time::interval(std::time::Duration::from_millis(8));
@@ -116,7 +121,13 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     let deadline=tokio::time::sleep(std::time::Duration::from_secs(30));tokio::pin!(deadline);
     let result=async {
         loop {tokio::select!{
-            command=commands.recv(),if command_open=>{if command.is_some(){requested=true}else{command_open=false}},
+            command=commands.recv(),if command_open=>{
+                match command {
+                    Some(Command::Files)=>{requested=true},
+                    Some(Command::Type)=>{type_requested=true},
+                    None=>{command_open=false},
+                }
+            },
             _=terminate.recv()=>return Ok(()),
             _=tokio::signal::ctrl_c()=>return Ok(()),
             result=session.step()=>result?,
@@ -145,6 +156,33 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                     }
                 }
                 #[cfg(not(uu_gtk))] {if requested{log::warn!("File window requires GTK3");requested=false;}}
+                                if type_requested {
+                    type_requested=false;
+                    if !input.enabled() {
+                        log::warn!("Secure type command ignored: view-only session");
+                    } else if std::env::var_os("UU_INPUT_ENV").is_none() {
+                        log::warn!("Secure type command ignored: set UU_INPUT_ENV (stdin is the command channel)");
+                    } else {
+                        match super::secure_input::load_secret(std::io::Cursor::new([] as [u8;0])) {
+                            Ok(secret) => {
+                                let chars=secret.chars_count();
+                                match super::secure_input::expand(secret.as_str(), window.mac) {
+                                    Ok(actions) => {
+                                        drop(secret);
+                                        log::info!("Secure input prepared: chars={} events={}", chars, actions.len());
+                                        if session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false) {
+                                            for a in actions { session.peer.send_input(&a.to_json()).await?; }
+                                        } else {
+                                            log::warn!("Secure type command ignored: CONTROL not ready");
+                                        }
+                                    }
+                                    Err(e) => { drop(secret); log::warn!("Secure type expand failed: {e}"); }
+                                }
+                            }
+                            Err(e) => log::warn!("Secure type load failed: {e}"),
+                        }
+                    }
+                }
                 if session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false){for m in messages{session.peer.send_input(&m).await?;}}
                 else {input.release_all();}
                 if quit{return Ok(())}
