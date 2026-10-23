@@ -144,12 +144,14 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                     if type_job.is_some() {
                         let _=pending.reply.send(super::type_ipc::TypeResponse{ok:false,events:0,chars:0,snapshot:None,error:Some("Secure input busy".into())});
                     } else {
+                        let mut snapshot_create_new=false;
                         if pending.request.snapshot.as_ref().map_or(true, |s| s.is_empty()) {
                             if let Ok(path)=super::type_ipc::default_snapshot_path(device) {
                                 pending.request.snapshot=Some(path.display().to_string());
+                                snapshot_create_new=true;
                             }
                         }
-                        match start_type_job(pending, window.mac, input.enabled()) {
+                        match start_type_job(pending, window.mac, input.enabled(), snapshot_create_new) {
                             Ok(job)=>type_job=Some(job),
                             Err(())=>{},
                         }
@@ -236,13 +238,14 @@ struct TypeJob {
     next_at: tokio::time::Instant,
     chars: usize,
     snapshot_path: Option<std::path::PathBuf>,
+    snapshot_create_new: bool,
     phase: TypePhase,
     reply: Option<tokio::sync::oneshot::Sender<super::type_ipc::TypeResponse>>,
     done: bool,
 }
 enum TypePhase { Sending, WaitSnap(tokio::time::Instant) }
 
-fn start_type_job(mut pending: super::type_ipc::PendingType, mac: bool, enabled: bool) -> Result<TypeJob, ()> {
+fn start_type_job(mut pending: super::type_ipc::PendingType, mac: bool, enabled: bool, snapshot_create_new: bool) -> Result<TypeJob, ()> {
     let reply = pending.reply;
     let respond_err = |reply: tokio::sync::oneshot::Sender<super::type_ipc::TypeResponse>, msg: String| {
         let _ = reply.send(super::type_ipc::TypeResponse{ok:false,events:0,chars:0,snapshot:None,error:Some(msg)});
@@ -271,6 +274,7 @@ fn start_type_job(mut pending: super::type_ipc::PendingType, mac: bool, enabled:
         next_at: tokio::time::Instant::now(),
         chars,
         snapshot_path,
+        snapshot_create_new,
         phase: TypePhase::Sending,
         reply: Some(reply),
         done: false,
@@ -298,6 +302,7 @@ fn enqueue_local_type(
         next_at: tokio::time::Instant::now(),
         chars,
         snapshot_path: snapshot,
+        snapshot_create_new: false,
         phase: TypePhase::Sending,
         reply,
         done: false,
@@ -335,7 +340,7 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
             let mut snap = None;
             if let Some(path) = job.snapshot_path.clone() {
                 if let Some(frame) = window.last_frame.as_ref() {
-                    match super::type_ipc::write_png_rgb(&path, frame.width, frame.height, &frame.rgb) {
+                    match super::type_ipc::write_png_rgb(&path, frame.width, frame.height, &frame.rgb, job.snapshot_create_new) {
                         Ok(()) => {
                             log::info!("Secure input snapshot written: {}", path.display());
                             snap = Some(path.display().to_string());

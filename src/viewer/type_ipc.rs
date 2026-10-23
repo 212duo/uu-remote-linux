@@ -14,13 +14,27 @@ use tokio::{
 /// Max JSON frame (header + secret). 16 KiB secret + margin.
 pub const MAX_FRAME: usize = 20 * 1024;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct TypeRequest {
     pub delay_ms: u64,
     pub omit_last: usize,
     pub snapshot: Option<String>,
-    /// Secret text; never Debug-printed by this module's helpers.
+    /// Secret text; Debug only exposes length.
     pub secret: String,
+}
+
+impl std::fmt::Debug for TypeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypeRequest")
+            .field("delay_ms", &self.delay_ms)
+            .field("omit_last", &self.omit_last)
+            .field(
+                "snapshot",
+                &self.snapshot.as_ref().map(|s| format!("len={}", s.len())),
+            )
+            .field("secret_len", &self.secret.len())
+            .finish()
+    }
 }
 
 impl Drop for TypeRequest {
@@ -50,6 +64,26 @@ fn zeroize_string(s: &mut String) {
     s.clear();
 }
 
+/// Ensure `dir` is a real directory owned by us with mode & 0o077 == 0 (no symlink).
+pub fn validate_private_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::symlink_metadata(dir).map_err(|_| "Cannot inspect type-ipc directory")?;
+    if meta.file_type().is_symlink() {
+        return Err("Type-ipc path is a symlink".into());
+    }
+    if !meta.file_type().is_dir() {
+        return Err("Type-ipc path is not a directory".into());
+    }
+    let me = unsafe { libc::getuid() };
+    if meta.uid() != me {
+        return Err("Type-ipc directory owner mismatch".into());
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err("Type-ipc directory permissions too open".into());
+    }
+    Ok(())
+}
+
 pub fn runtime_dir() -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -67,14 +101,21 @@ pub fn runtime_dir() -> Result<PathBuf, String> {
     } else {
         base.join("uu-viewer-type")
     };
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|_| "Cannot create private type-ipc directory")?;
-    // Tighten permissions if the directory already existed.
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    // Use symlink_metadata so a pre-planted symlink is not followed before we decide.
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => {
+            validate_private_dir(&dir)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|_| "Cannot create private type-ipc directory")?;
+            validate_private_dir(&dir)?;
+        }
+        Err(_) => return Err("Cannot inspect type-ipc directory".into()),
+    }
     Ok(dir)
 }
 
@@ -240,7 +281,15 @@ pub async fn send_to_viewer(device: &str, mut request: TypeRequest) -> Result<Ty
 }
 
 /// Encode an RGB24 frame as a minimal PNG (8-bit RGB, no filtering beyond None).
-pub fn write_png_rgb(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<(), String> {
+/// Write RGB24 as PNG. Always uses O_NOFOLLOW + mode 0600.
+/// `create_new`: true for default runtime paths (refuse overwrite); false for user `--snapshot`.
+pub fn write_png_rgb(
+    path: &Path,
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    create_new: bool,
+) -> Result<(), String> {
     let expected = width as usize * height as usize * 3;
     if rgb.len() != expected || width == 0 || height == 0 {
         return Err("Snapshot frame size mismatch".into());
@@ -279,11 +328,14 @@ pub fn write_png_rgb(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result
     chunk(b"IEND", &[], &mut png);
 
     use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    if create_new {
+        opts.create_new(true);
+    } else {
+        opts.create(true).truncate(true);
+    }
+    let mut file = opts
         .open(path)
         .map_err(|_| "Cannot write snapshot file")?;
     file.write_all(&png).map_err(|_| "Cannot write snapshot file")?;
@@ -329,7 +381,7 @@ mod tests {
     fn png_roundtrip_header_and_mode() {
         let dir = tempfile_dir();
         let path = dir.join("t.png");
-        write_png_rgb(&path, 2, 2, &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]).unwrap();
+        write_png_rgb(&path, 2, 2, &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255], true).unwrap();
         let meta = std::fs::metadata(&path).unwrap();
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
@@ -427,7 +479,143 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    fn uuidish() -> String {
+    #[test]
+    fn validate_private_dir_rejects_symlink_and_open_mode() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let base = std::env::temp_dir().join(format!(
+            "uu-type-ipc-val-{}-{}",
+            std::process::id(),
+            uuidish()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
+
+        let open = base.join("open");
+        std::fs::DirBuilder::new().mode(0o755).create(&open).unwrap();
+        let err = validate_private_dir(&open).unwrap_err();
+        assert!(err.contains("permissions"), "{err}");
+        assert!(!err.contains("sentinel"));
+
+        let good = base.join("good");
+        std::fs::DirBuilder::new().mode(0o700).create(&good).unwrap();
+        validate_private_dir(&good).unwrap();
+
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        let err = validate_private_dir(&link).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+
+        let file = base.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let err = validate_private_dir(&file).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn runtime_dir_rejects_preexisting_open_or_symlink() {
+        use std::os::unix::fs::DirBuilderExt;
+        // Serialize against other tests that read/write process environment.
+        let _env = crate::viewer::secure_input::ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "uu-type-ipc-rt-{}-{}",
+            std::process::id(),
+            uuidish()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
+
+        // Point XDG_RUNTIME_DIR at a private base; plant a bad uu-viewer-type child.
+        let child = base.join("uu-viewer-type");
+        std::fs::DirBuilder::new().mode(0o755).create(&child).unwrap();
+        let _guard = EnvGuard::set("XDG_RUNTIME_DIR", base.to_str().unwrap());
+        let err = runtime_dir().unwrap_err();
+        assert!(err.contains("permissions"), "{err}");
+        let _ = std::fs::remove_dir_all(&child);
+
+        let target = base.join("target");
+        std::fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &child).unwrap();
+        let err = runtime_dir().unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        let _ = std::fs::remove_file(&child);
+
+        // Fresh create succeeds and validates.
+        let dir = runtime_dir().unwrap();
+        assert!(dir.ends_with("uu-viewer-type"));
+        validate_private_dir(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_png_refuses_symlink_target() {
+        let dir = tempfile_dir();
+        let real = dir.join("real.png");
+        let link = dir.join("link.png");
+        std::fs::write(&real, b"old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = write_png_rgb(
+            &link,
+            1,
+            1,
+            &[1, 2, 3],
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("Cannot write snapshot"), "{err}");
+        // Original untouched
+        assert_eq!(std::fs::read(&real).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_png_create_new_refuses_existing() {
+        let dir = tempfile_dir();
+        let path = dir.join("exists.png");
+        std::fs::write(&path, b"old").unwrap();
+        let err = write_png_rgb(&path, 1, 1, &[1, 2, 3], true).unwrap_err();
+        assert!(err.contains("Cannot write snapshot"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn type_request_debug_shows_secret_len_only() {
+        let req = TypeRequest {
+            delay_ms: 40,
+            omit_last: 1,
+            snapshot: Some("/tmp/out.png".into()),
+            secret: "sentinel-SECRET-9f3a".into(),
+        };
+        let d = format!("{req:?}");
+        assert!(d.contains("secret_len: 20") || d.contains("secret_len: 20,"), "{d}");
+        assert!(!d.contains("sentinel"));
+        assert!(!d.contains("SECRET"));
+        assert!(!d.contains("9f3a"));
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+        fn uuidish() -> String {
         format!(
             "{:x}",
             std::time::SystemTime::now()

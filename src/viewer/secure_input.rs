@@ -95,8 +95,13 @@ impl KeyAction {
 }
 
 /// Key event list that wipes key codes on drop.
-#[derive(Debug)]
 pub struct ActionList(Vec<KeyAction>);
+
+impl std::fmt::Debug for ActionList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ActionList(len={})", self.0.len())
+    }
+}
 
 impl ActionList {
     pub fn new(actions: Vec<KeyAction>) -> Self {
@@ -499,6 +504,21 @@ mod tests {
         assert!(!d.contains("hunter"));
         assert!(!p.contains("hunter"));
         assert!(p.contains("***"));
+    }
+
+    #[test]
+    fn action_list_debug_shows_len_only() {
+        let list = ActionList::new(vec![
+            KeyAction::Press(0x41),
+            KeyAction::Release(0x41),
+            KeyAction::Press(0x42),
+            KeyAction::Release(0x42),
+        ]);
+        let d = format!("{list:?}");
+        assert_eq!(d, "ActionList(len=4)");
+        assert!(!d.contains("0x41"));
+        assert!(!d.contains("Press"));
+        assert!(!d.contains("41"));
     }
 
     #[test]

@@ -531,9 +531,10 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
     uuremote-viewer type DEVICE [--delay-ms 40] [--omit-last 1] [--snapshot /path/out.png]
   # Or: printf '%s' '…' | uuremote-viewer type DEVICE
   # Validate only, no network: uuremote-viewer type DEVICE --dry-run
-  # If no desktop viewer is running you must pass --new-session (opens a new peer and may replace the live desktop; upstream #30)
+  # If no desktop viewer is running you must pass --new-session (opens a new peer and replaces any already-open desktop window; upstream #30)
   ```
   Brace tokens: `{Enter}` `{Tab}` `{Esc}` `{Backspace}` `{Ctrl+Alt+Del}` …; `{{` is a literal `{`.
+  **Layout**: characters are mapped for **US QWERTY** only (non-US layouts may mistype symbols/letters).
   **Windows numeric PIN**: Windows often submits automatically once enough digits are entered — usually no `{Enter}` needed. Use `--omit-last N` to omit the last N characters when you want to fill without signing in.
   Logs and `--dry-run` report lengths/event counts only. When reusing a session, about one second after sending, a PNG frame is saved (default under `$XDG_RUNTIME_DIR/uu-viewer-type/`, mode 0600); the path is logged and printed as `snapshot=…`.
 - Ctrl+Alt+F in the desktop window opens the files window on the same connection. `UU_VIEWER_AUDIO=0` disables sound,

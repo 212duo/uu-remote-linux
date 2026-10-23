@@ -487,9 +487,10 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
     uuremote-viewer type DEVICE [--delay-ms 40] [--omit-last 1] [--snapshot /path/out.png]
   # 或：printf '%s' '……' | uuremote-viewer type DEVICE
   # 只检查、不连网：uuremote-viewer type DEVICE --dry-run
-  # 没有正在运行的桌面会话时必须显式：--new-session（会新开连接，可能顶掉已有桌面，见上游 #30）
+  # 没有正在运行的桌面会话时必须显式：--new-session（会新开连接，并顶掉已打开的桌面窗口，见上游 #30）
   ```
   特殊键用花括号：`{Enter}` `{Tab}` `{Esc}` `{Backspace}` `{Ctrl+Alt+Del}` 等；`{{` 表示字面 `{`。
+  **布局**：字符按 **US QWERTY** 物理键位映射（非美式布局的符号/字母可能对不上）。
   **Windows 数字 PIN**：输满位数后系统常会自动提交，一般不必再发 `{Enter}`；若只想填入、不登录，用 `--omit-last N` 省略最后 N 个字符。
   日志与 `--dry-run` 输出只含长度/事件数，不含明文。复用会话时，发送约 1 秒后会保存一帧 PNG（默认写在 `$XDG_RUNTIME_DIR/uu-viewer-type/`，权限 0600），路径打在日志并打印 `snapshot=…`。
 - 桌面窗口中按 Ctrl+Alt+F 打开文件窗口（复用同一连接）。`UU_VIEWER_AUDIO=0` 关闭声音，`UU_VIEWER_CLIPBOARD=0` 关闭剪贴板，
